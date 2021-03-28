@@ -23,6 +23,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use target_lexicon::PointerWidth;
 #[cfg(windows)]
 use winapi;
@@ -140,10 +141,10 @@ pub struct JITModule {
     libcall_names: Box<dyn Fn(ir::LibCall) -> String>,
     memory: MemoryHandle,
     declarations: ModuleDeclarations,
-    function_got_entries: SecondaryMap<FuncId, Option<NonNull<*const u8>>>,
+    function_got_entries: SecondaryMap<FuncId, Option<NonNull<AtomicPtr<u8>>>>,
     function_plt_entries: SecondaryMap<FuncId, Option<NonNull<[u8; 16]>>>,
-    data_object_got_entries: SecondaryMap<DataId, Option<NonNull<*const u8>>>,
-    libcall_got_entries: HashMap<ir::LibCall, NonNull<*const u8>>,
+    data_object_got_entries: SecondaryMap<DataId, Option<NonNull<AtomicPtr<u8>>>>,
+    libcall_got_entries: HashMap<ir::LibCall, NonNull<AtomicPtr<u8>>>,
     libcall_plt_entries: HashMap<ir::LibCall, NonNull<[u8; 16]>>,
     compiled_functions: SecondaryMap<FuncId, Option<CompiledBlob>>,
     compiled_data_objects: SecondaryMap<DataId, Option<CompiledBlob>>,
@@ -185,14 +186,14 @@ impl JITModule {
             .memory
             .writable
             .allocate(
-                std::mem::size_of::<*const u8>(),
-                std::mem::align_of::<*const u8>().try_into().unwrap(),
+                std::mem::size_of::<AtomicPtr<u8>>(),
+                std::mem::align_of::<AtomicPtr<u8>>().try_into().unwrap(),
             )
             .unwrap()
             .cast::<*const u8>();
         self.function_got_entries[id] = Some(NonNull::new(got_entry).unwrap());
         unsafe {
-            std::ptr::write(got_entry, val);
+            std::ptr::write(got_entry, AtomicPtr::new(val as *mut _));
         }
         let plt_entry = self
             .memory
@@ -232,7 +233,7 @@ impl JITModule {
             cfg!(target_arch = "x86_64"),
             "PLT is currently only supported on x86_64"
         );
-        let plt_entry = self
+        let plt_entry = module
             .memory
             .code
             .allocate(std::mem::size_of::<[u8; 16]>(), EXECUTABLE_DATA_ALIGNMENT)
@@ -676,7 +677,7 @@ impl Module for JITModule {
 
         if self.isa.flags().is_pic() {
             unsafe {
-                std::ptr::write(self.function_got_entries[id].unwrap().as_ptr(), ptr);
+                (*self.function_got_entries[id].unwrap().as_ptr()).store(ptr, Ordering::SeqCst);
             }
         }
 
@@ -748,7 +749,7 @@ impl Module for JITModule {
 
         if self.isa.flags().is_pic() {
             unsafe {
-                std::ptr::write(self.function_got_entries[id].unwrap().as_ptr(), ptr);
+                (*self.function_got_entries[id].unwrap().as_ptr()).store(ptr, Ordering::SeqCst);
             }
         }
 
@@ -830,7 +831,7 @@ impl Module for JITModule {
         self.data_objects_to_finalize.push(id);
         if self.isa.flags().is_pic() {
             unsafe {
-                std::ptr::write(self.data_object_got_entries[id].unwrap().as_ptr(), ptr);
+                (*self.data_object_got_entries[id].unwrap().as_ptr()).store(ptr, Ordering::SeqCst);
             }
         }
 
