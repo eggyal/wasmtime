@@ -181,7 +181,7 @@ impl JITModule {
             .or_else(|| lookup_with_dlsym(name))
     }
 
-    fn new_func_plt_entry(&mut self, id: FuncId, val: *const u8) {
+    fn new_got_entry(&mut self, val: *const u8) -> NonNull<AtomicPtr<u8>> {
         let got_entry = self
             .memory
             .writable
@@ -190,66 +190,56 @@ impl JITModule {
                 std::mem::align_of::<AtomicPtr<u8>>().try_into().unwrap(),
             )
             .unwrap()
-            .cast::<*const u8>();
-        self.function_got_entries[id] = Some(NonNull::new(got_entry).unwrap());
+            .cast::<AtomicPtr<u8>>();
         unsafe {
             std::ptr::write(got_entry, AtomicPtr::new(val as *mut _));
         }
+        NonNull::new(got_entry).unwrap()
+    }
+
+    fn new_plt_entry(&mut self, got_entry: NonNull<AtomicPtr<u8>>) -> NonNull<[u8; 16]> {
         let plt_entry = self
             .memory
             .code
             .allocate(std::mem::size_of::<[u8; 16]>(), EXECUTABLE_DATA_ALIGNMENT)
             .unwrap()
             .cast::<[u8; 16]>();
-        self.record_function_for_perf(
-            plt_entry as *mut _,
-            std::mem::size_of::<[u8; 16]>(),
-            &format!("{}@plt", self.declarations.get_function_decl(id).name),
-        );
-        self.function_plt_entries[id] = Some(NonNull::new(plt_entry).unwrap());
         unsafe {
             Self::write_plt_entry_bytes(plt_entry, got_entry);
         }
+        NonNull::new(plt_entry).unwrap()
+    }
+
+    fn new_func_plt_entry(&mut self, id: FuncId, val: *const u8) {
+        let got_entry = self.new_got_entry(val);
+        self.function_got_entries[id] = Some(got_entry);
+        let plt_entry = self.new_plt_entry(got_entry);
+        self.record_function_for_perf(
+            plt_entry.as_ptr().cast(),
+            std::mem::size_of::<[u8; 16]>(),
+            &format!("{}@plt", self.declarations.get_function_decl(id).name),
+        );
+        self.function_plt_entries[id] = Some(plt_entry);
     }
 
     fn new_data_got_entry(&mut self, id: DataId, val: *const u8) {
-        let got_entry = self
-            .memory
-            .writable
-            .allocate(
-                std::mem::size_of::<*const u8>(),
-                std::mem::align_of::<*const u8>().try_into().unwrap(),
-            )
-            .unwrap()
-            .cast::<*const u8>();
-        self.data_object_got_entries[id] = Some(NonNull::new(got_entry).unwrap());
-        unsafe {
-            std::ptr::write(got_entry, val);
-        }
+        let got_entry = self.new_got_entry(val);
+        self.data_object_got_entries[id] = Some(got_entry);
     }
 
-    unsafe fn write_plt_entry_bytes(plt_ptr: *mut [u8; 16], got_ptr: *mut *const u8) {
+    unsafe fn write_plt_entry_bytes(plt_ptr: *mut [u8; 16], got_ptr: NonNull<AtomicPtr<u8>>) {
         assert!(
             cfg!(target_arch = "x86_64"),
             "PLT is currently only supported on x86_64"
         );
-        let plt_entry = module
-            .memory
-            .code
-            .allocate(std::mem::size_of::<[u8; 16]>(), EXECUTABLE_DATA_ALIGNMENT)
-            .unwrap()
-            .cast::<[u8; 16]>();
         // jmp *got_ptr; ud2; ud2; ud2; ud2; ud2
         let mut plt_val = [
             0xff, 0x25, 0, 0, 0, 0, 0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b,
         ];
-        let what = got_ptr as isize - 4;
-        let at = plt_entry as isize + 2;
+        let what = got_ptr.as_ptr() as isize - 4;
+        let at = plt_ptr as isize + 2;
         plt_val[2..6].copy_from_slice(&i32::to_ne_bytes(i32::try_from(what - at).unwrap()));
-        unsafe {
-            std::ptr::write(plt_entry, plt_val);
-        }
-        plt_entry
+        std::ptr::write(plt_ptr, plt_val);
     }
 
     fn get_address(&self, name: &ir::ExternalName) -> *const u8 {
@@ -295,29 +285,21 @@ impl JITModule {
         }
     }
 
-    fn get_got_address(&self, name: &ir::ExternalName) -> *const u8 {
+    fn get_got_address(&self, name: &ir::ExternalName) -> NonNull<AtomicPtr<u8>> {
         match *name {
             ir::ExternalName::User { .. } => {
                 if ModuleDeclarations::is_function(name) {
                     let func_id = FuncId::from_name(name);
-                    self.function_got_entries[func_id]
-                        .unwrap()
-                        .as_ptr()
-                        .cast::<u8>()
+                    self.function_got_entries[func_id].unwrap()
                 } else {
                     let data_id = DataId::from_name(name);
-                    self.data_object_got_entries[data_id]
-                        .unwrap()
-                        .as_ptr()
-                        .cast::<u8>()
+                    self.data_object_got_entries[data_id].unwrap()
                 }
             }
-            ir::ExternalName::LibCall(ref libcall) => self
+            ir::ExternalName::LibCall(ref libcall) => *self
                 .libcall_got_entries
                 .get(libcall)
-                .unwrap_or_else(|| panic!("can't resolve libcall {}", libcall))
-                .as_ptr()
-                .cast::<u8>(),
+                .unwrap_or_else(|| panic!("can't resolve libcall {}", libcall)),
             _ => panic!("invalid ExternalName {}", name),
         }
     }
@@ -409,7 +391,7 @@ impl JITModule {
                 .expect("function must be compiled before it can be finalized");
             func.perform_relocations(
                 |name| self.get_address(name),
-                |name| self.get_got_address(name),
+                |name| self.get_got_address(name).as_ptr().cast(),
                 |name| self.get_plt_address(name),
             );
         }
@@ -422,7 +404,7 @@ impl JITModule {
                 .expect("data object must be compiled before it can be finalized");
             data.perform_relocations(
                 |name| self.get_address(name),
-                |name| self.get_got_address(name),
+                |name| self.get_got_address(name).as_ptr().cast(),
                 |name| self.get_plt_address(name),
             );
         }
@@ -482,13 +464,9 @@ impl JITModule {
                 continue;
             };
             let got_entry = module.new_got_entry(addr);
-            module
-                .libcall_got_entries
-                .insert(libcall, NonNull::new(got_entry).unwrap());
+            module.libcall_got_entries.insert(libcall, got_entry);
             let plt_entry = module.new_plt_entry(got_entry);
-            module
-                .libcall_plt_entries
-                .insert(libcall, NonNull::new(plt_entry).unwrap());
+            module.libcall_plt_entries.insert(libcall, plt_entry);
         }
 
         module
@@ -691,7 +669,7 @@ impl Module for JITModule {
                             .cast::<u8>(),
                         _ => panic!("invalid ExternalName {}", name),
                     },
-                    |name| self.get_got_address(name),
+                    |name| self.get_got_address(name).as_ptr().cast(),
                     |name| self.get_plt_address(name),
                 );
         } else {
@@ -752,7 +730,7 @@ impl Module for JITModule {
                 .unwrap()
                 .perform_relocations(
                     |name| unreachable!("non GOT or PLT relocation in function {} to {}", id, name),
-                    |name| self.get_got_address(name),
+                    |name| self.get_got_address(name).as_ptr().cast(),
                     |name| self.get_plt_address(name),
                 );
         } else {
