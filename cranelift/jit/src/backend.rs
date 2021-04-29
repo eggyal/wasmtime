@@ -297,6 +297,14 @@ impl JITModule {
         }
     }
 
+    /// Returns the given function's entry in the Global Offset Table.
+    ///
+    /// Panics if there's no entry in the table for the given function.
+    pub fn read_got_entry(&self, func_id: FuncId) -> *const u8 {
+        let got_entry = self.function_got_entries[func_id].unwrap();
+        unsafe { got_entry.as_ref() }.load(Ordering::SeqCst)
+    }
+
     fn get_got_address(&self, name: &ir::ExternalName) -> NonNull<AtomicPtr<u8>> {
         match *name {
             ir::ExternalName::User { .. } => {
